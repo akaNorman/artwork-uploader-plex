@@ -59,7 +59,9 @@ ACTION_REPLACE = "replace"        # a different poster is there - back it up, sa
 ACTION_KEEP = "keep"              # the winner is already the file in the folder - just record it
 ACTION_STAGE = "stage"            # season not in Plex yet - save to the asset folder only
 ACTION_UPLOAD_STAGED = "upload"   # an earlier staged season has arrived in Plex - upload it now
-ACTION_SKIP = "skip"              # nothing can be done (season not in Plex and staging off, ...)
+ACTION_SKIP = "skip"              # left alone on purpose (an asset folder shared by different items)
+
+NOT_COMPARED_NOTE = "could not download the winner to compare - the current file may already be it"
 
 
 def season_slot(season: int) -> str:
@@ -239,20 +241,33 @@ class TPDbClient:
         'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
     }
 
+    # ThePosterDB answers 429 (too many requests) once a long run has fetched a few thousand
+    # images. Wait and try again instead of failing, waiting longer each time (or as long as it
+    # asks). After this many failed downloads in a row, stop fetching images for the rest of the
+    # run: every slot that needed one is left alone, and the next run picks them up.
+    RATE_LIMIT_WAITS = (60, 120, 300, 600)
+    MAX_CONSECUTIVE_FAILURES = 20
+
     def __init__(self, delay: float = RANKED_TPDB_REQUEST_DELAY, timeout: int = 10,
-                 attempts: int = 3, backoff: float = 1.0) -> None:
+                 attempts: int = 3, backoff: float = 1.0, sleep: Callable[[float], None] = time.sleep,
+                 on_wait: Optional[Callable[[str], None]] = None) -> None:
         self.delay = delay
         self.timeout = timeout
         self.attempts = attempts
         self.backoff = backoff
+        self.sleep = sleep
+        self.on_wait = on_wait
         self._last = 0.0
         self.page_requests = 0
         self.image_requests = 0
+        self.rate_limit_waits = 0
+        self.consecutive_failures = 0
+        self.gave_up = False
 
     def _pace(self) -> None:
         wait = self.delay - (time.monotonic() - self._last)
         if wait > 0:
-            time.sleep(wait)
+            self.sleep(wait)
         self._last = time.monotonic()
 
     def tmdb_id(self, asset_id: int) -> Tuple[bool, Optional[int]]:
@@ -271,15 +286,34 @@ class TPDbClient:
 
     def download(self, url: str) -> Tuple[bytes, str]:
         """(image bytes, file extension)."""
-        self._pace()
-        self.image_requests += 1
+        if self.gave_up:
+            raise ScraperException("ThePosterDB kept refusing downloads earlier in this run")
 
         def _fetch():
             response = requests.get(url, headers=self.HEADERS, timeout=self.timeout)
             response.raise_for_status()
             return response
 
-        response, _ = call_with_retry(_fetch, self.attempts, self.backoff)
+        for attempt in range(len(self.RATE_LIMIT_WAITS) + 1):
+            self._pace()
+            self.image_requests += 1
+            try:
+                response, _ = call_with_retry(_fetch, self.attempts, self.backoff)
+                break
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status != 429 or attempt == len(self.RATE_LIMIT_WAITS):
+                    self._failed()
+                    raise
+                wait = self._retry_after(e.response) or self.RATE_LIMIT_WAITS[attempt]
+                self.rate_limit_waits += 1
+                if self.on_wait:
+                    self.on_wait(f"⏳ Ranked mode • ThePosterDB says too many requests, waiting {wait // 60 or 1} min before trying again")
+                self.sleep(wait)
+            except Exception:
+                self._failed()
+                raise
+        self.consecutive_failures = 0
         content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
         ext = mimetypes.guess_extension(content_type) if content_type else None
         if ext in (None, ".jpe", ".jpeg"):
@@ -287,6 +321,22 @@ class TPDbClient:
         if ext not in IMAGE_EXTENSIONS:
             ext = ".jpg"
         return response.content, ext
+
+    def _failed(self) -> None:
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES and not self.gave_up:
+            self.gave_up = True
+            if self.on_wait:
+                self.on_wait(f"⚠️ Ranked mode • {self.consecutive_failures} downloads in a row failed - no more images are "
+                             f"fetched this run; anything that needed one is left alone and the next run picks it up")
+
+    @staticmethod
+    def _retry_after(response) -> int:
+        """Seconds ThePosterDB asked us to wait (Retry-After), capped at 15 minutes; 0 if it didn't say."""
+        try:
+            return min(int(response.headers.get("Retry-After", 0)), 900)
+        except (TypeError, ValueError, AttributeError):
+            return 0
 
 
 # ---------------------------------------------------------------------------------------------
@@ -323,6 +373,7 @@ class RankedResult:
     report_path: Optional[str] = None
     page_requests: int = 0
     image_requests: int = 0
+    not_compared: int = 0   # slots whose winner couldn't be downloaded to compare with the current file
     stopped: bool = False
 
     @property
@@ -367,7 +418,7 @@ class RankedService:
         self.stage_assets = stage_assets
         self.dry_run = dry_run
         self.store = store or RankedStore(getattr(asset_index, "path", ASSET_INDEX_PATH))
-        self.tpdb = tpdb or TPDbClient(attempts=retry_attempts, backoff=retry_backoff)
+        self.tpdb = tpdb or TPDbClient(attempts=retry_attempts, backoff=retry_backoff, on_wait=self._log)
         self.retry_attempts = retry_attempts
         self.retry_backoff = retry_backoff
         self.backup_root = backup_root
@@ -451,6 +502,8 @@ class RankedService:
                         continue
                 decisions.append(decision)
                 result.counts[decision.action] = result.counts.get(decision.action, 0) + 1
+                if NOT_COMPARED_NOTE in decision.note:
+                    result.not_compared += 1
                 if decision.action in (ACTION_NEW, ACTION_REPLACE, ACTION_STAGE, ACTION_UPLOAD_STAGED):
                     author = decision.candidate.row["author"] or decision.candidate.row["user_key"]
                     result.by_user[author] = result.by_user.get(author, 0) + 1
@@ -636,7 +689,7 @@ class RankedService:
                 return Decision(ACTION_KEEP, entry, slot, chosen, dest_dir, existing,
                                 note="" if in_plex else "season not in Plex yet")
             if chosen_md5 is None:
-                compare_note = "could not download the winner to compare - the current file may already be it"
+                compare_note = NOT_COMPARED_NOTE
             action = ACTION_REPLACE
         else:
             action = ACTION_NEW
@@ -766,6 +819,17 @@ class RankedService:
                 return True
 
             data, ext = self._download(chosen)
+            md5 = _md5_bytes(data)
+            same = next((p for p in self._existing_files(decision.dest_dir, slot_file_stem(slot))
+                         if _md5_file(p) == md5), None)
+            if same is not None:
+                # It couldn't be compared before (the download failed then), and the file already
+                # there turns out to be the winner: keep it rather than replace it with itself.
+                in_plex = decision.action != ACTION_STAGE
+                self.store.set_applied(library, rating_key, slot, chosen.asset_id, chosen.row["user_key"],
+                                       md5, same, uploaded=in_plex)
+                decision.action, decision.note = ACTION_KEEP, "already the winner (checked when applying)"
+                return True
             path = self._write_file(decision, data, ext)
             uploaded = False
             if decision.action != ACTION_STAGE:
@@ -874,6 +938,10 @@ class RankedService:
         minutes = seconds / 60
         self._log(f"🏆 {mode} • {' • '.join(parts)} • {result.page_requests} poster page(s) and "
                   f"{result.image_requests} image(s) fetched • {minutes:.1f} min")
+        if result.not_compared:
+            self._log(f"⚠️ Ranked mode • {result.not_compared} slot(s) couldn't be compared with the current file (the "
+                      f"winner's download failed) - they're listed as replacements but may already be right; "
+                      f"{'run the dry run again to check them' if result.dry_run else 'they were checked again when applied'}")
         if result.by_user:
             ranked = sorted(result.by_user.items(), key=lambda kv: self.rank.get(kv[0].casefold(), 99))
             self._log("🏆 Changes by user • " + " • ".join(f"{user}: {n}" for user, n in ranked))

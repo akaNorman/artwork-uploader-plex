@@ -92,6 +92,9 @@ class FakeTPDb:
 
     def download(self, url):
         self.image_requests += 1
+        if url in getattr(self, "fail_once", set()):
+            self.fail_once.discard(url)
+            raise RuntimeError("429 Too Many Requests")
         return self.images[url], ".jpg"
 
 
@@ -436,6 +439,103 @@ def test_a_backup_never_overwrites_an_earlier_backup(env):
     backup_dir = os.path.join(env.backup, svc.run_stamp, "Movies", "Heat (1995)")
     assert sorted(read(os.path.join(backup_dir, name)) for name in os.listdir(backup_dir)) == [b"original", b"second"]
     assert read(os.path.join(folder, "poster.jpg")) == b"third"
+
+
+def test_a_winner_that_could_not_be_compared_is_kept_if_it_turns_out_identical(env):
+    movie = FakeItem(1, "Alien", 1979, 348, path="/m/Alien (1979)/Alien.mkv")
+    folder = os.path.join(env.kometa, "Movies", "Alien (1979)")
+    os.makedirs(folder)
+    with open(os.path.join(folder, "poster.jpg"), "wb") as f:
+        f.write(b"same")
+    env.index.record("darkmatte", [asset(100, "Alien", 1979)])
+    tpdb = FakeTPDb(images={f"{TPDB}/100": b"same"})
+    tpdb.fail_once = {f"{TPDB}/100"}   # the comparison download fails, the apply download works
+
+    result = service(env, [FakeLibrary("Movies", "movie", [movie])], [], ["darkmatte"], tpdb).run()
+
+    assert result.counts == {ACTION_KEEP: 1}
+    assert movie.uploads == []
+    assert not os.path.exists(env.backup)
+    assert os.listdir(folder) == ["poster.jpg"]
+    assert env.store.all_applied()[("Movies", 1, "poster")]["asset_id"] == 100
+
+
+def test_dry_run_reports_slots_it_could_not_compare(env):
+    movie = FakeItem(1, "Alien", 1979, 348, path="/m/Alien (1979)/Alien.mkv")
+    folder = os.path.join(env.kometa, "Movies", "Alien (1979)")
+    os.makedirs(folder)
+    with open(os.path.join(folder, "poster.jpg"), "wb") as f:
+        f.write(b"whatever")
+    env.index.record("darkmatte", [asset(100, "Alien", 1979)])
+    tpdb = FakeTPDb(images={f"{TPDB}/100": b"new"})
+    tpdb.fail_once = {f"{TPDB}/100"}
+
+    result = service(env, [FakeLibrary("Movies", "movie", [movie])], [], ["darkmatte"], tpdb, dry_run=True).run()
+
+    assert result.counts == {ACTION_REPLACE: 1} and result.not_compared == 1
+    assert any("couldn't be compared" in line for line in env.logs)
+
+
+class _Response:
+    def __init__(self, status, headers=None, content=b"img"):
+        self.status_code = status
+        self.headers = {"Content-Type": "image/jpeg", **(headers or {})}
+        self.content = content
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.exceptions.HTTPError(f"{self.status_code}", response=self)
+
+
+def _client(monkeypatch, statuses, **kwargs):
+    from services import ranked_service
+    replies = iter(statuses)
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append(url)
+        status = next(replies)
+        return status if isinstance(status, _Response) else _Response(status)
+    monkeypatch.setattr(ranked_service.requests, "get", fake_get)
+    waits = []
+    messages = []
+    client = ranked_service.TPDbClient(delay=0, attempts=1, sleep=waits.append, on_wait=messages.append, **kwargs)
+    return client, calls, waits, messages
+
+
+def test_too_many_requests_waits_and_tries_again(monkeypatch):
+    client, calls, waits, messages = _client(monkeypatch, [429, 429, 200])
+
+    data, ext = client.download("https://theposterdb.com/api/assets/1")
+
+    assert data == b"img" and ext == ".jpg"
+    assert len(calls) == 3
+    assert [w for w in waits if w >= 1] == [60, 120]
+    assert len(messages) == 2 and client.consecutive_failures == 0
+
+
+def test_too_many_requests_honours_retry_after(monkeypatch):
+    client, calls, waits, _ = _client(monkeypatch, [_Response(429, {"Retry-After": "45"}), 200])
+
+    client.download("https://theposterdb.com/api/assets/1")
+
+    assert [w for w in waits if w >= 1] == [45]
+
+
+def test_downloads_stop_for_the_run_after_repeated_failures(monkeypatch):
+    import requests
+    client, calls, _, messages = _client(monkeypatch, [404] * 50)
+
+    for _ in range(client.MAX_CONSECUTIVE_FAILURES):
+        with pytest.raises(requests.exceptions.HTTPError):
+            client.download("https://theposterdb.com/api/assets/1")
+    assert client.gave_up and any("no more images" in m for m in messages)
+
+    made = len(calls)
+    with pytest.raises(Exception):
+        client.download("https://theposterdb.com/api/assets/2")
+    assert len(calls) == made   # nothing more is asked of ThePosterDB this run
 
 
 def test_a_user_listed_twice_keeps_their_higher_place(env):
