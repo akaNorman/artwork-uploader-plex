@@ -210,6 +210,11 @@ class WebhookService:
                 clean_title = _clean_title(event.title)
                 log_Label = f"webhook_{clean_title}_{event.year}" if event.year else f"webhook_{_clean_title(clean_title)}"
                 log_file = log_to_file(log_Label)
+            if self._ranked_dry_run():
+                # Fork: a ranked dry run changes nothing anywhere, imports included.
+                _log(f"📥 Webhook | Ranked mode dry run is on - '{event.label()}' not processed, nothing changed")
+                self._finish(event, key, started_at, tally, RunOutcome.SKIPPED.value)
+                return
             if self._ranked_enabled():
                 # Fork: ranked mode applies the same choice the daily run makes (highest-ranked
                 # user per slot), straight to Plex and the Kometa asset folder.
@@ -282,7 +287,13 @@ class WebhookService:
     @staticmethod
     def _ranked_enabled() -> bool:
         config = globals.config
-        return bool(getattr(config, "ranked_mode", False)) and not bool(getattr(config, "ranked_dry_run", True))
+        return getattr(config, "ranked_mode", False) is True and getattr(config, "ranked_dry_run", True) is False
+
+    @staticmethod
+    def _ranked_dry_run() -> bool:
+        config = globals.config
+        # Only an explicit false turns the dry run off.
+        return getattr(config, "ranked_mode", False) is True and getattr(config, "ranked_dry_run", True) is not False
 
     def _attempt_ranked(self, event: WebhookEvent, key, started_at: str, tally: ProcessingCallbacks,
                         attempt: int, log_file: Optional[str]) -> None:

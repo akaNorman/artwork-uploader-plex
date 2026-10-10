@@ -356,7 +356,8 @@ class RankedService:
     ) -> None:
         self.movie_libraries = movie_libraries or []
         self.tv_libraries = tv_libraries or []
-        self.user_keys = [key.casefold() for key in user_keys if key]
+        # A user listed twice keeps their first (higher) position.
+        self.user_keys = list(dict.fromkeys(key.casefold() for key in user_keys if key))
         self.rank = {key: i for i, key in enumerate(self.user_keys)}
         self.asset_index = asset_index
         self.callbacks = callbacks
@@ -381,6 +382,8 @@ class RankedService:
         self._meta: Dict[int, sqlite3.Row] = {}
         self._applied: Dict[Tuple[str, int, str], sqlite3.Row] = {}
         self._folders: Dict[Tuple[str, int], Optional[str]] = {}
+        # (library, asset folder) -> the different items (TMDb ID, or rating key without one) using it
+        self._folder_owners: Dict[Tuple[str, str], set] = {}
         self._seasons: Dict[Tuple[str, int], Dict[int, object]] = {}
 
     # --- logging helpers ---------------------------------------------------------------------
@@ -442,7 +445,7 @@ class RankedService:
                     continue
                 if decision is None:
                     continue
-                if not self.dry_run:
+                if not self.dry_run and decision.action != ACTION_SKIP:
                     if not self._execute(decision):
                         result.failed += 1
                         continue
@@ -466,11 +469,16 @@ class RankedService:
         index.movie_libraries = list(self.movie_libraries)
         index.tv_libraries = list(self.tv_libraries)
         self._by_tmdb = {}
+        self._folder_owners = {}
         for library in self.movie_libraries + self.tv_libraries:
             entries = index.index_items(library, library.all())
             for entry in entries:
                 if entry["tmdb_id"] is not None:
                     self._by_tmdb.setdefault((entry["type"], entry["tmdb_id"]), []).append(entry)
+                folder = self._asset_folder(entry)
+                if folder:
+                    owner = entry["tmdb_id"] if entry["tmdb_id"] is not None else ("rating_key", entry["rating_key"])
+                    self._folder_owners.setdefault((library.title, folder), set()).add(owner)
             self._debug(f"Listed {len(entries)} items from {library.title}")
         self._library_index = index
 
@@ -572,10 +580,13 @@ class RankedService:
             else:
                 page_tmdb = self._read_page(candidate.asset_id)
                 meta = self._meta.get(candidate.asset_id)
-                if meta is None:
-                    # The page couldn't be fetched this time; don't guess, try the next poster
-                    # and come back to this one on the next run.
-                    continue
+                if meta is None or not meta["page_checked"]:
+                    # The page couldn't be fetched this time. Don't guess, and don't fall back
+                    # to a lower-ranked poster either (the next run would only swap it back):
+                    # leave the slot alone until the page can be read.
+                    self._debug(f"Could not read the poster page for asset {candidate.asset_id}; "
+                                f"slot left alone this run")
+                    return None
             if page_tmdb is None or page_tmdb == tmdb_id:
                 return candidate  # no ID on the page: trust the title match, as upstream does
         return None
@@ -606,25 +617,37 @@ class RankedService:
         dest_dir = os.path.join(self.kometa_base, library, folder)
         existing = self._existing_files(dest_dir, slot_file_stem(slot))
 
+        # Kometa matches an asset folder by name, so a folder shared by different items (films
+        # side by side in one folder, or loose files in the library root) can't be given one
+        # item's poster without it landing on the others too. Leave it alone and report it.
+        owners = self._folder_owners.get((library, folder), set())
+        if len(owners) > 1:
+            return Decision(ACTION_SKIP, entry, slot, chosen, dest_dir, existing,
+                            note=f"asset folder '{folder}' is shared by {len(owners)} different items in {library} - left alone")
+
         in_plex = season is None or self._season_in_plex(entry, season)
 
         chosen_md5 = self._known_md5(chosen.asset_id)
+        compare_note = ""
         if existing:
             if chosen_md5 is None:
                 chosen_md5 = self._fetch_md5(chosen)
             if chosen_md5 is not None and any(_md5_file(path) == chosen_md5 for path in existing):
                 return Decision(ACTION_KEEP, entry, slot, chosen, dest_dir, existing,
                                 note="" if in_plex else "season not in Plex yet")
+            if chosen_md5 is None:
+                compare_note = "could not download the winner to compare - the current file may already be it"
             action = ACTION_REPLACE
         else:
             action = ACTION_NEW
 
         if not in_plex:
             if self.stage_assets and season != 0:
+                note = "season not in Plex yet, saved for Kometa"
                 return Decision(ACTION_STAGE, entry, slot, chosen, dest_dir, existing,
-                                note="season not in Plex yet, saved for Kometa")
+                                note=f"{note}; {compare_note}" if compare_note else note)
             return None
-        return Decision(action, entry, slot, chosen, dest_dir, existing)
+        return Decision(action, entry, slot, chosen, dest_dir, existing, note=compare_note)
 
     def _known_md5(self, asset_id: int) -> Optional[str]:
         meta = self._meta.get(asset_id)
@@ -716,6 +739,8 @@ class RankedService:
         description = self._describe(entry, slot)
         author = chosen.row["author"] or chosen.row["user_key"]
         try:
+            if decision.action == ACTION_SKIP:
+                return True  # reported only, never touched
             if decision.action == ACTION_KEEP:
                 self.store.set_applied(library, rating_key, slot, chosen.asset_id, chosen.row["user_key"],
                                        self._known_md5(chosen.asset_id),
@@ -764,17 +789,30 @@ class RankedService:
            new file atomically."""
         stem = slot_file_stem(decision.slot)
         os.makedirs(decision.dest_dir, exist_ok=True)
-        for old in self._existing_files(decision.dest_dir, stem):
-            backup_dir = os.path.join(self.backup_root, self.run_stamp, decision.entry["library"],
-                                      os.path.basename(decision.dest_dir))
-            os.makedirs(backup_dir, exist_ok=True)
-            shutil.move(old, os.path.join(backup_dir, os.path.basename(old)))
         dest = os.path.join(decision.dest_dir, stem + ext)
         tmp = dest + ".tmp"
+        # The new file is written in full before anything is moved, so a failed write leaves the
+        # current poster where it is.
         with open(tmp, "wb") as f:
             f.write(data)
+        for old in self._existing_files(decision.dest_dir, stem):
+            shutil.move(old, self._backup_path(decision, os.path.basename(old)))
         os.replace(tmp, dest)
         return dest
+
+    def _backup_path(self, decision: Decision, filename: str) -> str:
+        """Where a replaced file goes. Never an existing file: a backup must not overwrite an
+           earlier backup."""
+        backup_dir = os.path.join(self.backup_root, self.run_stamp, decision.entry["library"],
+                                  os.path.basename(decision.dest_dir))
+        os.makedirs(backup_dir, exist_ok=True)
+        target = os.path.join(backup_dir, filename)
+        root, ext = os.path.splitext(filename)
+        n = 1
+        while os.path.exists(target):
+            target = os.path.join(backup_dir, f"{root}.{n}{ext}")
+            n += 1
+        return target
 
     def _upload(self, entry: dict, slot: str, path: str) -> None:
         if slot == POSTER_SLOT:
@@ -800,7 +838,8 @@ class RankedService:
                 writer = csv.writer(f)
                 writer.writerow(["action", "library", "title", "year", "slot", "chosen_user", "rank",
                                  "asset_id", "poster_page", "asset_folder", "current_file", "note"])
-                order = {ACTION_REPLACE: 0, ACTION_NEW: 1, ACTION_STAGE: 2, ACTION_UPLOAD_STAGED: 3, ACTION_KEEP: 4}
+                order = {ACTION_REPLACE: 0, ACTION_NEW: 1, ACTION_STAGE: 2, ACTION_UPLOAD_STAGED: 3,
+                         ACTION_SKIP: 4, ACTION_KEEP: 5}
                 for d in sorted(decisions, key=lambda d: (order.get(d.action, 9), d.entry.get("library") or "",
                                                           d.entry.get("title") or "", d.slot)):
                     writer.writerow([
@@ -827,6 +866,8 @@ class RankedService:
             parts.append(f"{c[ACTION_STAGE]} {verb} stage for seasons not in Plex yet".replace("  ", " "))
         if c.get(ACTION_UPLOAD_STAGED):
             parts.append(f"{c[ACTION_UPLOAD_STAGED]} staged {'would be ' if result.dry_run else ''}uploaded")
+        if c.get(ACTION_SKIP):
+            parts.append(f"{c[ACTION_SKIP]} left alone (shared asset folder, see the report)")
         parts.append(f"{c.get(ACTION_KEEP, 0)} already right")
         if result.failed:
             parts.append(f"{result.failed} failed")

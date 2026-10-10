@@ -12,7 +12,7 @@ import pytest
 from core.enums import MediaType
 from models.callbacks import ProcessingCallbacks
 from services.asset_index import AssetIndex
-from services.ranked_service import (ACTION_KEEP, ACTION_NEW, ACTION_REPLACE, ACTION_STAGE,
+from services.ranked_service import (ACTION_KEEP, ACTION_NEW, ACTION_REPLACE, ACTION_SKIP, ACTION_STAGE,
                                      ACTION_UPLOAD_STAGED, RankedService, RankedStore)
 
 TPDB = "https://theposterdb.com/api/assets"
@@ -86,6 +86,8 @@ class FakeTPDb:
 
     def tmdb_id(self, asset_id):
         self.page_requests += 1
+        if self.pages.get(asset_id) == "unreachable":
+            return False, None
         return True, self.pages.get(asset_id)
 
     def download(self, url):
@@ -370,3 +372,78 @@ def test_a_failed_upload_is_not_recorded_so_it_retries_next_run(env):
     assert result.failed == 1
     assert env.store.all_applied() == {}
     assert env.callbacks.failed_counter[0] == 1
+
+
+def test_folder_shared_by_different_items_is_left_alone(env):
+    # Two different films side by side in one folder: Kometa would give both the same poster.
+    a = FakeItem(1, "Alien", 1979, 348, path="/m/Sci-Fi/Alien.mkv")
+    b = FakeItem(2, "Aliens", 1986, 679, path="/m/Sci-Fi/Aliens.mkv")
+    folder = os.path.join(env.kometa, "Movies", "Sci-Fi")
+    os.makedirs(folder)
+    with open(os.path.join(folder, "poster.jpg"), "wb") as f:
+        f.write(b"whatever-is-there")
+    env.index.record("darkmatte", [asset(100, "Alien", 1979), asset(101, "Aliens", 1986)])
+    tpdb = FakeTPDb(images={f"{TPDB}/100": b"alien", f"{TPDB}/101": b"aliens"})
+
+    result = service(env, [FakeLibrary("Movies", "movie", [a, b])], [], ["darkmatte"], tpdb).run()
+
+    assert result.counts == {ACTION_SKIP: 2}
+    assert read(os.path.join(folder, "poster.jpg")) == b"whatever-is-there"
+    assert a.uploads == [] and b.uploads == []
+    assert env.store.all_applied() == {}
+    assert not os.path.exists(env.backup)
+
+
+def test_editions_of_one_film_in_one_folder_are_not_treated_as_shared(env):
+    cut = FakeItem(1, "Alien", 1979, 348, path="/m/Alien (1979)/Alien.mkv")
+    dc = FakeItem(2, "Alien", 1979, 348, path="/m/Alien (1979)/Alien {edition-Director's Cut}.mkv")
+    env.index.record("darkmatte", [asset(100, "Alien", 1979)])
+    tpdb = FakeTPDb(images={f"{TPDB}/100": b"alien"})
+
+    result = service(env, [FakeLibrary("Movies", "movie", [cut, dc])], [], ["darkmatte"], tpdb).run()
+
+    assert ACTION_SKIP not in result.counts
+    assert read(os.path.join(env.kometa, "Movies", "Alien (1979)", "poster.jpg")) == b"alien"
+
+
+def test_unreadable_poster_page_does_not_fall_back_to_a_lower_ranked_user(env):
+    movie = FakeItem(1, "The Thing", 1982, 1091, path="/m/The Thing (1982)/x.mkv")
+    env.index.record("darkmatte", [asset(100, "The Thing", 1983)])     # year one out: page needed
+    env.index.record("other", [asset(200, "The Thing", 1982)])
+    tpdb = FakeTPDb(images={f"{TPDB}/200": b"lower"}, pages={100: "unreachable"})
+
+    result = service(env, [FakeLibrary("Movies", "movie", [movie])], [], ["darkmatte", "other"], tpdb).run()
+
+    assert result.counts == {}
+    assert movie.uploads == []
+    assert 100 not in env.store.all_meta()  # the failure isn't cached as 'no TMDb ID'
+
+
+def test_a_backup_never_overwrites_an_earlier_backup(env):
+    movie = FakeItem(1, "Heat", 1995, 949, path="/m/Heat (1995)/Heat.mkv")
+    movies = FakeLibrary("Movies", "movie", [movie])
+    folder = os.path.join(env.kometa, "Movies", "Heat (1995)")
+    os.makedirs(folder)
+    with open(os.path.join(folder, "poster.jpg"), "wb") as f:
+        f.write(b"original")
+    env.index.record("other", [asset(200, "Heat", 1995)])
+    tpdb = FakeTPDb(images={f"{TPDB}/200": b"second", f"{TPDB}/300": b"third"})
+    svc = service(env, [movies], [], ["darkmatte", "other"], tpdb)
+    svc.run()
+    env.index.record("darkmatte", [asset(300, "Heat", 1995)])
+    svc.run()  # same run stamp, so the same backup folder
+
+    backup_dir = os.path.join(env.backup, svc.run_stamp, "Movies", "Heat (1995)")
+    assert sorted(read(os.path.join(backup_dir, name)) for name in os.listdir(backup_dir)) == [b"original", b"second"]
+    assert read(os.path.join(folder, "poster.jpg")) == b"third"
+
+
+def test_a_user_listed_twice_keeps_their_higher_place(env):
+    movie = FakeItem(1, "Heat", 1995, 949, path="/m/Heat (1995)/Heat.mkv")
+    env.index.record("darkmatte", [asset(100, "Heat", 1995)])
+    env.index.record("other", [asset(200, "Heat", 1995)])
+    tpdb = FakeTPDb(images={f"{TPDB}/100": b"darkmatte", f"{TPDB}/200": b"other"})
+
+    service(env, [FakeLibrary("Movies", "movie", [movie])], [], ["darkmatte", "other", "DarkMatte"], tpdb).run()
+
+    assert movie.uploads == [b"darkmatte"]

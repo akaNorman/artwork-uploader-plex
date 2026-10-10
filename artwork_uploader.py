@@ -448,7 +448,7 @@ def process_bulk_import_from_ui(
         globals.bulk_bar["speed"] = "smooth"
 
         # Fork: ranked mode handles the ThePosterDB user lines in one pass
-        if getattr(globals.config, "ranked_mode", False):
+        if getattr(globals.config, "ranked_mode", False) is True:
             parsed_urls, errors = run_ranked_pass(instance, parsed_urls, tally)
 
         # Loop through the bulk list
@@ -629,13 +629,22 @@ def run_ranked_pass(instance: Instance, parsed_urls: list, tally: ProcessingCall
     from services.asset_index import AssetIndex
     from services.ranked_service import RankedService, RankedStore
 
+    config = globals.config
+    # Only an explicit false turns the dry run off.
+    dry_run = getattr(config, "ranked_dry_run", True) is not False
     user_lines = [line for line in parsed_urls if "theposterdb.com/user/" in (line.url or "").lower()]
     remaining = [line for line in parsed_urls if line not in user_lines]
+    if dry_run and remaining:
+        # A dry run changes nothing, so the other lines aren't run the normal (writing) way either.
+        update_log(instance, f"🧪 Ranked mode dry run • {len(remaining)} line(s) that aren't ThePosterDB user URLs skipped - nothing changed for them")
+        remaining = []
     if not user_lines:
+        if dry_run:
+            update_log(instance, "⚠️ Ranked mode dry run is on but this bulk file has no ThePosterDB user URLs - nothing to do")
+            return [], 0
         update_log(instance, "⚠️ Ranked mode is on but this bulk file has no ThePosterDB user URLs - running it normally")
         return parsed_urls, 0
 
-    config = globals.config
     kometa_base = "/assets" if globals.docker else (config.kometa_base or "")
     if not kometa_base:
         update_log(instance, "🔴 Ranked mode needs the Kometa asset directory set - nothing was changed")
@@ -662,13 +671,13 @@ def run_ranked_pass(instance: Instance, parsed_urls: list, tally: ProcessingCall
     index = AssetIndex()
     store = RankedStore(index.path)
     store.set_order(user_keys)
-    mode = "dry run - nothing will be changed" if config.ranked_dry_run else "applying changes"
+    mode = "dry run - nothing will be changed" if dry_run else "applying changes"
     update_log(instance, f"🏆 Ranked mode • {len(user_keys)} users, best first: {', '.join(user_keys)} • {mode}")
 
     service = RankedService(
         globals.plex.movie_libraries, globals.plex.tv_libraries, user_keys, index, callbacks,
         file_types=config.tpdb_filters, kometa_base=kometa_base, stage_assets=config.stage_assets,
-        dry_run=config.ranked_dry_run, store=store,
+        dry_run=dry_run, store=store,
         retry_attempts=config.upload_retry_attempts, retry_backoff=config.upload_retry_backoff_seconds)
     result = service.run()
     callbacks.assets(result.slots_considered)

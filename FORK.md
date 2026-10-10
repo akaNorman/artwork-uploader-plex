@@ -29,7 +29,8 @@ Sonarr/Radarr imports (the webhook) use the same ranking and the same apply step
 
 *Ranked mode dry run* is on by default. A dry run makes every decision, then writes a CSV report to
 `config/ranked_reports/` (action, item, slot, chosen user, poster page link) and changes nothing in Plex or
-in the asset folders. While dry run is on, the webhook keeps upstream behaviour.
+in the asset folders. Nothing else changes anything either: lines in the bulk file that aren't ThePosterDB
+user URLs are skipped (not run the normal way), and Sonarr/Radarr imports are logged and skipped.
 
 The first dry run is slow (a one-off): to know whether a poster already in an asset folder is the winner, it
 downloads each winner once to compare checksums. Checksums and poster-page TMDb IDs are remembered, so the
@@ -41,6 +42,17 @@ real run and every later run don't fetch them again.
 - Title matches but the year is one out (or missing): the poster page on ThePosterDB is read once, only
   if that poster would win, to confirm the TMDb ID.
 - A title that matches several different items (same-name remakes): the poster page is read once.
+- If a poster page that's needed can't be read, the slot is left alone for that run rather than given to a
+  lower-ranked user.
+- An asset folder used by more than one different item in a library (films side by side in one folder, loose
+  files in the library root) is never written to, since Kometa would put that poster on all of them. These
+  show as `skip` in the report.
+- A user listed twice in the bulk file keeps their first (higher) place.
+
+## Writing files
+
+The new poster is written in full first; only then is the old file moved to the backup folder. A backup never
+overwrites an earlier backup (a second one in the same folder becomes `poster.1.jpg`, and so on).
 
 ## State
 

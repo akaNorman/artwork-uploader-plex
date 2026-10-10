@@ -64,9 +64,10 @@ def _line(url):
     return types.SimpleNamespace(url=url, options=Options())
 
 
-def test_bulk_ranked_pass_ranks_in_file_order_and_leaves_other_lines(monkeypatch):
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_bulk_ranked_pass_ranks_in_file_order_and_leaves_other_lines(monkeypatch, dry_run):
     monkeypatch.setattr(app_globals, "config", types.SimpleNamespace(
-        kometa_base="/k", tpdb_filters=["movie_poster"], stage_assets=True, ranked_dry_run=True,
+        kometa_base="/k", tpdb_filters=["movie_poster"], stage_assets=True, ranked_dry_run=dry_run,
         upload_retry_attempts=1, upload_retry_backoff_seconds=0), raising=False)
     monkeypatch.setattr(app_globals, "docker", False, raising=False)
     monkeypatch.setattr(app_globals, "plex", types.SimpleNamespace(movie_libraries=[], tv_libraries=[]), raising=False)
@@ -94,8 +95,9 @@ def test_bulk_ranked_pass_ranks_in_file_order_and_leaves_other_lines(monkeypatch
     remaining, errors = artwork_uploader.run_ranked_pass(types.SimpleNamespace(), lines, tally)
 
     assert seen["users"] == ["darkmatte", "mapas01"]
-    assert seen["dry_run"] is True and seen["kometa_base"] == "/k"
-    assert [l.url for l in remaining] == ["https://mediux.pro/sets/1"]
+    assert seen["dry_run"] is dry_run and seen["kometa_base"] == "/k"
+    # A dry run changes nothing, so the other lines are not left for the normal (writing) loop.
+    assert [l.url for l in remaining] == ([] if dry_run else ["https://mediux.pro/sets/1"])
     assert errors == 0
     assert RankedStore(AssetIndex().path).order() == ["darkmatte", "mapas01"]
     assert tally.assets_processed[0] == 3
@@ -116,13 +118,27 @@ def test_bulk_ranked_pass_without_a_kometa_folder_changes_nothing(monkeypatch):
     assert "Kometa asset directory" in logs[0]
 
 
+def test_dry_run_bulk_file_without_user_urls_runs_nothing(monkeypatch):
+    monkeypatch.setattr(app_globals, "config", types.SimpleNamespace(kometa_base="/k", ranked_dry_run=True), raising=False)
+    monkeypatch.setattr(artwork_uploader, "update_log", lambda instance, message: None)
+    monkeypatch.setattr(ranked_service, "RankedService", lambda *a, **k: pytest.fail("must not run"))
+
+    remaining, errors = artwork_uploader.run_ranked_pass(
+        types.SimpleNamespace(), [_line("https://mediux.pro/sets/1")], ProcessingCallbacks())
+
+    assert remaining == [] and errors == 0
+
+
 # --- webhook ---------------------------------------------------------------------------------
 
 def test_webhook_uses_ranked_path_only_when_live(monkeypatch):
     from services.webhook_service import WebhookService
     monkeypatch.setattr(app_globals, "config", types.SimpleNamespace(ranked_mode=True, ranked_dry_run=True), raising=False)
-    assert WebhookService._ranked_enabled() is False      # dry run: webhook keeps upstream behaviour
+    assert WebhookService._ranked_enabled() is False
+    assert WebhookService._ranked_dry_run() is True       # dry run: imports are not processed at all
     app_globals.config.ranked_dry_run = False
     assert WebhookService._ranked_enabled() is True
+    assert WebhookService._ranked_dry_run() is False
     app_globals.config.ranked_mode = False
     assert WebhookService._ranked_enabled() is False
+    assert WebhookService._ranked_dry_run() is False      # ranked mode off: upstream behaviour
