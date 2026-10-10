@@ -21,6 +21,11 @@ DEFAULT_WEB_HOST = "0.0.0.0"
 # File paths
 DEFAULT_CONFIG_PATH = "config.json"
 ASSET_INDEX_PATH = "config/asset_index.db"
+# Ranked mode (fork): where dry-run/apply reports go, where replaced asset files are moved to
+# (never deleted), and the pause between requests to ThePosterDB for poster pages and images.
+RANKED_REPORTS_DIR = "config/ranked_reports"
+RANKED_BACKUP_DIR = "config/replaced_assets"
+RANKED_TPDB_REQUEST_DELAY = 1.0
 DEFAULT_BULK_IMPORTS_DIR = "bulk_imports"
 DEFAULT_BULK_IMPORT_FILE = "bulk_import.txt"
 RUN_HISTORY_PATH = "config/run_history.json"

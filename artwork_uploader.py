@@ -447,6 +447,10 @@ def process_bulk_import_from_ui(
         globals.bulk_bar["message"] = message
         globals.bulk_bar["speed"] = "smooth"
 
+        # Fork: ranked mode handles the ThePosterDB user lines in one pass
+        if getattr(globals.config, "ranked_mode", False):
+            parsed_urls, errors = run_ranked_pass(instance, parsed_urls, tally)
+
         # Loop through the bulk list
         for i, parsed_line in enumerate(parsed_urls, 1):
             if globals.cancel_scrape:
@@ -573,22 +577,9 @@ def process_bulk_import_from_ui(
         globals.bulk_import_lock.release()
 
 # Scraped the URL then uploads what it's scraped to Plex or download to Kometa asset directory
-def scrape_and_upload(
-        instance: Instance,
-        url: str,
-        options: Options,
-        bulk: dict = None,
-        tally: ProcessingCallbacks = None
-    ):
-    """
-    Scrape artwork from a URL and upload to Plex.
-
-    This is now a thin wrapper around ArtworkProcessor that handles
-    UI updates via callbacks.
-
-    The caller owns the tally, so one run's counters survive across every URL in it.
-    A caller that wants no counting can leave it out and get a throwaway one.
-    """
+def make_ui_callbacks(instance: Instance, tally: ProcessingCallbacks = None) -> ProcessingCallbacks:
+    """Callbacks that send a run's status, log, debug and progress to the UI, sharing the
+       caller's tally counters (used by scrape_and_upload and by the ranked pass)."""
     # Create callbacks for UI updates
     def status_callback(message: str, color: str, spinner: bool, sticky: bool):
         update_status(instance, message, color, sticky=sticky, spinner=spinner)
@@ -623,6 +614,84 @@ def scrape_and_upload(
         on_debug=debug_callback,
         on_progress_update=progress_callback
     )
+    return callbacks
+
+
+def run_ranked_pass(instance: Instance, parsed_urls: list, tally: ProcessingCallbacks) -> tuple:
+    """Fork: ranked mode for a bulk run.
+
+    The ThePosterDB user URLs in the bulk file are the followed users and their order is the
+    ranking. Each user's cached index is refreshed (new uploads only), then one ranked pass picks
+    the best poster per item and slot and applies the changes (or, in a dry run, reports them).
+
+    Returns (remaining_lines, errors): any other lines in the file are left for the normal loop."""
+    from scrapers.theposterdb_scraper import ThePosterDBScraper
+    from services.asset_index import AssetIndex
+    from services.ranked_service import RankedService, RankedStore
+
+    user_lines = [line for line in parsed_urls if "theposterdb.com/user/" in (line.url or "").lower()]
+    remaining = [line for line in parsed_urls if line not in user_lines]
+    if not user_lines:
+        update_log(instance, "⚠️ Ranked mode is on but this bulk file has no ThePosterDB user URLs - running it normally")
+        return parsed_urls, 0
+
+    config = globals.config
+    kometa_base = "/assets" if globals.docker else (config.kometa_base or "")
+    if not kometa_base:
+        update_log(instance, "🔴 Ranked mode needs the Kometa asset directory set - nothing was changed")
+        return remaining, 1
+
+    callbacks = make_ui_callbacks(instance, tally)
+    errors = 0
+    user_keys = []
+    for i, line in enumerate(user_lines, 1):
+        if globals.cancel_scrape:
+            return remaining, errors
+        callbacks.progress(i - 1, len(user_lines), f"Ranked mode • checking users for new uploads • {i} of {len(user_lines)}", "bulk")
+        scraper = ThePosterDBScraper(line.url, callbacks)
+        scraper.set_options(line.options)
+        user_keys.append(scraper._user_key())
+        try:
+            scraper.refresh_index()
+        except ScraperException as e:
+            # The user's existing cache is still used for ranking; only their newest uploads
+            # are missing until the next run.
+            errors += 1
+            update_log(instance, f"❌ Could not check {line.url} for new uploads ({e}); using what is cached")
+
+    index = AssetIndex()
+    store = RankedStore(index.path)
+    store.set_order(user_keys)
+    mode = "dry run - nothing will be changed" if config.ranked_dry_run else "applying changes"
+    update_log(instance, f"🏆 Ranked mode • {len(user_keys)} users, best first: {', '.join(user_keys)} • {mode}")
+
+    service = RankedService(
+        globals.plex.movie_libraries, globals.plex.tv_libraries, user_keys, index, callbacks,
+        file_types=config.tpdb_filters, kometa_base=kometa_base, stage_assets=config.stage_assets,
+        dry_run=config.ranked_dry_run, store=store,
+        retry_attempts=config.upload_retry_attempts, retry_backoff=config.upload_retry_backoff_seconds)
+    result = service.run()
+    callbacks.assets(result.slots_considered)
+    return remaining, errors
+
+
+def scrape_and_upload(
+        instance: Instance,
+        url: str,
+        options: Options,
+        bulk: dict = None,
+        tally: ProcessingCallbacks = None
+    ):
+    """
+    Scrape artwork from a URL and upload to Plex.
+
+    This is now a thin wrapper around ArtworkProcessor that handles
+    UI updates via callbacks.
+
+    The caller owns the tally, so one run's counters survive across every URL in it.
+    A caller that wants no counting can leave it out and get a throwaway one.
+    """
+    callbacks = make_ui_callbacks(instance, tally)
 
     # Use the service to do the actual work
     try:

@@ -1305,6 +1305,10 @@ function getCurrentConfigForm() {
     // Checkbox for caching ThePosterDB user scrapes
     current_form.cache_user_scrapes = document.getElementById("cache_user_scrapes").checked;
 
+    // Fork: ranked mode and its dry-run switch
+    current_form.ranked_mode = document.getElementById("ranked_mode").checked;
+    current_form.ranked_dry_run = document.getElementById("ranked_dry_run").checked;
+
     // ThePosterDB user cache expiration threshold
     current_form.user_cache_refresh_days = parseInt(document.getElementById("user_cache_refresh_days").value) || 0;
 
@@ -1477,6 +1481,8 @@ function updateConfigUI(config) {
     document.getElementById("skip_locked_artwork").checked = config.skip_locked_artwork;
     document.getElementById("local_library_matching").checked = config.local_library_matching;
     document.getElementById("cache_user_scrapes").checked = config.cache_user_scrapes;
+    document.getElementById("ranked_mode").checked = !!config.ranked_mode;
+    document.getElementById("ranked_dry_run").checked = config.ranked_dry_run !== false;
     document.getElementById("user_cache_refresh_days").value = config.user_cache_refresh_days ?? 7;
     document.getElementById("plex_connect_timeout").value = config.plex_connect_timeout ?? 10;
     document.getElementById("kometa_download_timeout").value = config.kometa_download_timeout ?? 10;

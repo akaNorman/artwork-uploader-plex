@@ -171,6 +171,10 @@ class Config:
         self.kometa_download_timeout: int = DEFAULT_KOMETA_DOWNLOAD_TIMEOUT
         self.upload_retry_attempts: int = DEFAULT_UPLOAD_RETRY_ATTEMPTS
         self.upload_retry_backoff_seconds: float = DEFAULT_UPLOAD_RETRY_BACKOFF_SECONDS
+        # Fork: ranked mode (see services/ranked_service.py). Off by default; when switched on
+        # it starts as a dry run that only writes a report.
+        self.ranked_mode: bool = False
+        self.ranked_dry_run: bool = True
 
 
     def load(self) -> None:
@@ -233,6 +237,8 @@ class Config:
             self.kometa_download_timeout = config.get("kometa_download_timeout", DEFAULT_KOMETA_DOWNLOAD_TIMEOUT)
             self.upload_retry_attempts = config.get("upload_retry_attempts", DEFAULT_UPLOAD_RETRY_ATTEMPTS)
             self.upload_retry_backoff_seconds = config.get("upload_retry_backoff_seconds", DEFAULT_UPLOAD_RETRY_BACKOFF_SECONDS)
+            self.ranked_mode = config.get("ranked_mode", False)
+            self.ranked_dry_run = config.get("ranked_dry_run", True)
 
         except Exception as e:
             raise ConfigLoadError(f"Error loading configuration from '{self.path}': {e}") from e
@@ -309,7 +315,9 @@ class Config:
             "plex_connect_timeout": DEFAULT_PLEX_CONNECT_TIMEOUT,
             "kometa_download_timeout": DEFAULT_KOMETA_DOWNLOAD_TIMEOUT,
             "upload_retry_attempts": DEFAULT_UPLOAD_RETRY_ATTEMPTS,
-            "upload_retry_backoff_seconds": DEFAULT_UPLOAD_RETRY_BACKOFF_SECONDS
+            "upload_retry_backoff_seconds": DEFAULT_UPLOAD_RETRY_BACKOFF_SECONDS,
+            "ranked_mode": False,
+            "ranked_dry_run": True
         }
 
         if globals.docker:
@@ -376,7 +384,9 @@ class Config:
             "plex_connect_timeout": self.plex_connect_timeout,
             "kometa_download_timeout": self.kometa_download_timeout,
             "upload_retry_attempts": self.upload_retry_attempts,
-            "upload_retry_backoff_seconds": self.upload_retry_backoff_seconds
+            "upload_retry_backoff_seconds": self.upload_retry_backoff_seconds,
+            "ranked_mode": self.ranked_mode,
+            "ranked_dry_run": self.ranked_dry_run
         }
 
         try:

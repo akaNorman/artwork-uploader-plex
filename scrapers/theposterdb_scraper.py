@@ -440,11 +440,31 @@ class ThePosterDBScraper:
                 return parts[index + 1].casefold()
         return ""
 
-    def _scrape_user_cached(self) -> None:
-        """Incrementally crawl a user's uploads using the persistent index, then apply the
-           full catalogue from the index. Raises sqlite3.Error if the index is unusable, so the
-           caller can fall back to a full crawl."""
-        index = AssetIndex()
+    def refresh_index(self) -> int:
+        """Ranked mode: bring this user's cached index up to date and stop there.
+
+           Fetches the user page, crawls only until it reaches uploads already in the index
+           (or a full crawl when one is due), and records the result - exactly what a cached
+           scrape does - but skips hydrating the whole catalogue for processing. The ranked
+           pass reads the index directly afterwards, so nothing per poster happens here.
+           Returns the number of new uploads added to the index."""
+        if "/user/" not in self.url:
+            raise ScraperException(f"Ranked mode only follows ThePosterDB user URLs: {self.url}")
+        try:
+            self.soup = soup_utils.cook_soup(self.url)
+            self.get_set_author(self.soup)
+            self.scrape_user_info()
+            self.callbacks.log(f"🔄 TPDb user • {self.author} | Checking for new uploads ({self.user_uploads} in total)")
+            return self._refresh_user_index(AssetIndex())
+        except ScraperException:
+            raise
+        except Exception as e:
+            self.callbacks.debug(f"Error refreshing the index for {self.url}: {str(e)}")
+            raise ScraperException(f"Could not refresh ThePosterDB user: {self.url}") from e
+
+    def _refresh_user_index(self, index: AssetIndex) -> int:
+        """Incremental (or due full) crawl of the user's uploads into the index, with the same
+           safety rules as a cached scrape. Returns the number of new uploads recorded."""
         user_key = self._user_key()
         crawl_started_at = datetime.now(timezone.utc).isoformat()
         state = index.crawl_state(user_key)
@@ -490,6 +510,15 @@ class ThePosterDBScraper:
         if new_rows:
             self.callbacks.cached(new_rows)
             self.callbacks.log(f"🆕 TPDb user • {self.author} | {new_rows} new asset(s) added to the cache")
+        return new_rows
+
+    def _scrape_user_cached(self) -> None:
+        """Incrementally crawl a user's uploads using the persistent index, then apply the
+           full catalogue from the index. Raises sqlite3.Error if the index is unusable, so the
+           caller can fall back to a full crawl."""
+        index = AssetIndex()
+        user_key = self._user_key()
+        self._refresh_user_index(index)
 
         # Map md5(url) -> asset id for every asset ever recorded for this user (tombstones
         # included), so allow_artist_updates can recognise artwork we applied from this artist.

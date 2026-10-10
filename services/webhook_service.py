@@ -38,6 +38,11 @@ def _debug(message: str) -> None:
     from utils.notifications import debug_me
     debug_me(message, "WebhookService")
 
+def _kometa_base() -> str:
+    """Where the Kometa asset directory is, as upstream resolves it (fixed at /assets in Docker)."""
+    return "/assets" if globals.docker else (getattr(globals.config, "kometa_base", "") or "")
+
+
 def _clean_title(title: str) -> str:
     """Removes year in parenthesis from title"""
     return re.sub(r'\s*\(\d{4}\)$', '', title.strip())
@@ -205,6 +210,11 @@ class WebhookService:
                 clean_title = _clean_title(event.title)
                 log_Label = f"webhook_{clean_title}_{event.year}" if event.year else f"webhook_{_clean_title(clean_title)}"
                 log_file = log_to_file(log_Label)
+            if self._ranked_enabled():
+                # Fork: ranked mode applies the same choice the daily run makes (highest-ranked
+                # user per slot), straight to Plex and the Kometa asset folder.
+                self._attempt_ranked(event, key, started_at, tally, attempt, log_file)
+                return
             if artwork is None:
                 artwork = self._collect_artwork(event)
                 if not artwork:
@@ -267,6 +277,72 @@ class WebhookService:
         except Exception as error:
             _debug(f"Webhook apply failed for {event.label()}: {error}")
             outcome = RunOutcome.FAILED.value
+        self._finish(event, key, started_at, tally, outcome)
+
+    @staticmethod
+    def _ranked_enabled() -> bool:
+        config = globals.config
+        return bool(getattr(config, "ranked_mode", False)) and not bool(getattr(config, "ranked_dry_run", True))
+
+    def _attempt_ranked(self, event: WebhookEvent, key, started_at: str, tally: ProcessingCallbacks,
+                        attempt: int, log_file: Optional[str]) -> None:
+        """One ranked attempt for an imported title. Retries on the usual ladder while the title
+           is cached but not in Plex yet, or a season had to be staged because Plex hasn't scanned
+           it in yet."""
+        from services.ranked_service import RankedService, RankedStore, ACTION_STAGE
+        from core.enums import MediaType
+        outcome = RunOutcome.FAILED.value
+        try:
+            globals.plex.connect()
+            globals.plex.ensure_libraries()
+            config = globals.config
+            index = AssetIndex()
+            store = RankedStore(index.path)
+            user_keys = store.order() or [u.strip().casefold() for u in (config.webhook_tpdb_users or []) if u.strip()]
+            if not user_keys:
+                _log(f"📥 Webhook | Ranked mode has no ranking yet (run the bulk file once) - skipping '{event.label()}'")
+                self._finish(event, key, started_at, tally, RunOutcome.SKIPPED.value)
+                return
+            callbacks = ProcessingCallbacks(
+                on_log_update=_log, on_debug=lambda message, context=None: _debug(message),
+                success_counter=tally.success_counter, assets_processed=tally.assets_processed,
+                cached_counter=tally.cached_counter, locked_counter=tally.locked_counter,
+                failed_counter=tally.failed_counter)
+            kind = MediaType.MOVIE.value if event.kind == "movie" else MediaType.TV_SHOW.value
+            service = RankedService(
+                globals.plex.movie_libraries, globals.plex.tv_libraries, user_keys, index, callbacks,
+                file_types=config.tpdb_filters, kometa_base=_kometa_base(),
+                stage_assets=config.stage_assets, dry_run=False, store=store,
+                retry_attempts=config.upload_retry_attempts, retry_backoff=config.upload_retry_backoff_seconds,
+                write_report=False, quiet=True)
+            if attempt == 0:
+                _log(f"📥 Webhook | {event.source.title()} import: {event.label()}")
+            result = service.run(only_title=(kind, event.title, event.year))
+            tally.assets(result.slots_considered)
+
+            if result.assets_considered == 0:
+                _log(f"📥 Webhook | No cached artwork for '{event.label()}' from your ranked users")
+                self._finish(event, key, started_at, tally, RunOutcome.SKIPPED.value)
+                return
+            pending = result.slots_considered == 0 or result.counts.get(ACTION_STAGE, 0) > 0
+            if pending and attempt < len(WEBHOOK_RETRY_DELAYS):
+                delay = WEBHOOK_RETRY_DELAYS[attempt]
+                _debug(f"{event.label()} not fully in Plex yet, retrying in {delay}s")
+                timer = threading.Timer(delay, self._attempt,
+                                        args=(event, key, started_at, tally, attempt + 1, None, log_file))
+                timer.daemon = True
+                timer.start()
+                return
+            if result.slots_considered == 0:
+                _log(f"⚠️ Webhook | '{event.label()}' has not appeared in Plex, leaving it for the next scheduled run")
+                tally.failed(1)
+            if not tally.failed_counter[0]:
+                outcome = RunOutcome.SUCCESS.value
+            elif tally.success_counter[0]:
+                outcome = RunOutcome.PARTIAL.value
+        except Exception as error:
+            _debug(f"Ranked webhook apply failed for {event.label()}: {error}")
+            _log(f"❌ Webhook | {event.label()}: {error}")
         self._finish(event, key, started_at, tally, outcome)
 
     def _finish(self, event: WebhookEvent, key, started_at: str,

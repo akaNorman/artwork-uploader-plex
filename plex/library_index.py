@@ -129,31 +129,37 @@ class PlexLibraryIndex:
             self.library_snapshots[library.title] = new_snapshot
             self.last_refresh[library.title] = now
 
-            # Initializae index
-            self.index[library.title] = {}
-
-            n = 0
-            for item in library.all():
-                n += 1
-                # Index values come from the listing response only - without this, reading an attribute
-                # the item doesn't have (e.g. originalTitle on most items) makes plexapi reload the
-                # item, which would be one extra request per library item
-                item._autoReload = False
-                entry = {
-                    "title": item.title,
-                    "year": item.year,
-                    "tmdb_id": self._tmdb_id_from_guids(item.guids),
-                    "type": MediaType.TV_SHOW.value if library.type == "show" else MediaType.MOVIE.value,
-                    "rating_key": item.ratingKey,
-                    "library": library.title
-                }
-                for key in self._title_keys(item):
-                    self.index[library.title].setdefault(key, []).append(entry)
-
+            n = len(self.index_items(library, library.all()))
             debug_me(f"Indexed {n} {MediaType.TV_SHOW.value if library.type == 'show' else MediaType.MOVIE.value} items from library {library.title}")
             return True
 
         return False
+
+    def index_items(self, library, items) -> List[Dict]:
+        """(Re)build one library's slice of the index from an item listing and return the
+           entries. Each entry also carries the plexapi item itself, so a caller that needs more
+           than the index fields (ranked mode reads the media folder) can use the same listing
+           instead of asking Plex again."""
+        self.index[library.title] = {}
+        entries = []
+        for item in items:
+            # Index values come from the listing response only - without this, reading an attribute
+            # the item doesn't have (e.g. originalTitle on most items) makes plexapi reload the
+            # item, which would be one extra request per library item
+            item._autoReload = False
+            entry = {
+                "title": item.title,
+                "year": item.year,
+                "tmdb_id": self._tmdb_id_from_guids(item.guids),
+                "type": MediaType.TV_SHOW.value if library.type == "show" else MediaType.MOVIE.value,
+                "rating_key": item.ratingKey,
+                "library": library.title,
+                "item": item
+            }
+            entries.append(entry)
+            for key in self._title_keys(item):
+                self.index[library.title].setdefault(key, []).append(entry)
+        return entries
 
     @staticmethod
     def _tmdb_id_from_guids(guids) -> Optional[int]:

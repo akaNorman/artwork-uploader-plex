@@ -642,6 +642,21 @@
                                                 matching so it is much faster but it can reduce match accuracy."></i></span></label>
                                         </div>
                                         <div class="form-check form-switch mt-2">
+                                            <input class="form-check-input" type="checkbox" value="ranked_mode" id="ranked_mode"/>
+                                            <label for="ranked_mode" class="form-check-label">Ranked mode <span class="text-nowrap">(fork)
+                                                &nbsp;<i onclick="event.preventDefault(); event.stopPropagation();" class="bi bi-info-circle" data-bs-toggle="tooltip" data-bs-custom-class="wide-tooltip"
+                                                data-bs-title="TPDb users only: a bulk run checks each user in the file for new uploads, then picks, for every item and
+                                                every season, the poster from the highest user in the file (top line = best). Changes are saved to the Kometa asset folder
+                                                (anything replaced is moved to config/replaced_assets) and uploaded to Plex straight away. Sonarr/Radarr imports use the same ranking."></i></span></label>
+                                        </div>
+                                        <div class="form-check form-switch mt-2">
+                                            <input class="form-check-input" type="checkbox" value="ranked_dry_run" id="ranked_dry_run"/>
+                                            <label for="ranked_dry_run" class="form-check-label">Ranked mode dry <span class="text-nowrap">run
+                                                &nbsp;<i onclick="event.preventDefault(); event.stopPropagation();" class="bi bi-info-circle" data-bs-toggle="tooltip"
+                                                data-bs-title="With ranked mode on, only write a report of what would change (config/ranked_reports) and change nothing
+                                                in Plex or the asset folders. Turn off once you're happy with the report."></i></span></label>
+                                        </div>
+                                        <div class="form-check form-switch mt-2">
                                             <input class="form-check-input" type="checkbox" value="cache_user_scrapes" id="cache_user_scrapes"/>
                                             <label for="cache_user_scrapes" class="form-check-label">Cache TPDb user <span class="text-nowrap">pages
                                                 &nbsp;<i onclick="event.preventDefault(); event.stopPropagation();" class="bi bi-info-circle" data-bs-toggle="tooltip"

@@ -142,5 +142,11 @@
     "_upload_retry_attempts_help": "Total attempts (including the first) made for a transient upload failure - a timeout or a 5xx",
 
     "upload_retry_backoff_seconds": 1,
-    "_upload_retry_backoff_seconds_help": "Seconds to wait before the first retry, doubling after each subsequent attempt"
+    "_upload_retry_backoff_seconds_help": "Seconds to wait before the first retry, doubling after each subsequent attempt",
+
+    "ranked_mode": false,
+    "_ranked_mode_help": "Fork: bulk runs of ThePosterDB user URLs pick the highest-ranked user's poster per item and slot (the order of the users in the bulk file is the ranking), save it to the Kometa asset folder and upload it to Plex",
+
+    "ranked_dry_run": true,
+    "_ranked_dry_run_help": "Fork: with ranked mode on, only write a report of what would change (config/ranked_reports) and change nothing"
 }
