@@ -63,6 +63,19 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+def clean_settings_form(form) -> dict:
+    """Fork: the settings the Save button may change, from what the Settings page sent.
+
+    - Schedules are saved by their own add/delete handlers. The page's copy of them can be older
+      than what's saved (a schedule added since the page loaded), so it never overwrites them.
+    - An empty webhook token while webhooks are switched off isn't a request to forget the token
+      (older pages empty the box when webhooks are off)."""
+    form = dict(form or {})
+    form.pop("schedules", None)
+    if not form.get("enable_webhooks") and not (form.get("webhook_token") or "").strip():
+        form.pop("webhook_token", None)
+    return form
+
 def get_oidc_redirect_uri(config):
     if config.external_url:
         base_url = config.external_url.rstrip("/")
@@ -343,6 +356,84 @@ def setup_routes(web_app, config: Config):
             "current_path": abs_path,
             "folders": folders
         })
+
+    # --- Fork: Artwork tab (ranked mode) - browse every user's options, pin a different one ----
+    def _artwork_kind(value):
+        if value not in (MediaType.MOVIE.value, MediaType.TV_SHOW.value):
+            raise ValueError("kind must be a movie or a TV show")
+        return value
+
+    def _artwork_error(e, status=400):
+        return jsonify({"error": str(e)}), status
+
+    @web_app.route("/api/artwork/items", methods=["GET"])
+    @login_required
+    def artwork_items():
+        from services.artwork_browser import browser, ArtworkBrowserError
+        try:
+            items = browser.items(refresh=request.args.get("refresh") == "1")
+            return jsonify({"items": items,
+                            "dry_run": getattr(globals.config, "ranked_dry_run", True) is not False})
+        except ArtworkBrowserError as e:
+            return _artwork_error(e, 409)
+
+    @web_app.route("/api/artwork/item", methods=["GET"])
+    @login_required
+    def artwork_item():
+        from services.artwork_browser import browser, ArtworkBrowserError
+        try:
+            return jsonify(browser.item(_artwork_kind(request.args.get("kind")), int(request.args.get("tmdb_id", ""))))
+        except (ArtworkBrowserError, ValueError) as e:
+            return _artwork_error(e)
+
+    @web_app.route("/api/artwork/pin", methods=["POST"])
+    @web_app.route("/api/artwork/unpin", methods=["POST"])
+    @login_required
+    def artwork_pin():
+        from services.artwork_browser import browser, ArtworkBrowserError
+        data = request.get_json(silent=True)  # JSON only: a cross-site form can't send it
+        if not isinstance(data, dict):
+            return _artwork_error("expected JSON")
+        try:
+            kind, tmdb_id, slot = _artwork_kind(data.get("kind")), int(data.get("tmdb_id")), str(data.get("slot"))
+            if request.path.endswith("/unpin"):
+                return jsonify(browser.unpin(kind, tmdb_id, slot))
+            return jsonify(browser.pin(kind, tmdb_id, slot, int(data.get("asset_id"))))
+        except (ArtworkBrowserError, ValueError, TypeError) as e:
+            return _artwork_error(e)
+
+    @web_app.route("/api/artwork/thumb/<int:asset_id>", methods=["GET"])
+    @login_required
+    def artwork_thumb(asset_id):
+        from services.artwork_browser import browser, ArtworkBrowserError
+        try:
+            data = browser.thumbnail(asset_id)
+        except ArtworkBrowserError as e:
+            return _artwork_error(e, 404)
+        except Exception as e:
+            debug_me(f"Artwork thumbnail for {asset_id} failed: {e}")
+            return _artwork_error("could not fetch the poster", 502)
+        response = web_app.response_class(data, mimetype="image/jpeg")
+        response.headers["Cache-Control"] = "private, max-age=604800"
+        return response
+
+    @web_app.route("/api/artwork/current", methods=["GET"])
+    @login_required
+    def artwork_current():
+        from services.artwork_browser import browser, ArtworkBrowserError
+        try:
+            data = browser.current_thumbnail(request.args.get("library", ""), int(request.args.get("rating_key", "")),
+                                             request.args.get("slot", ""))
+        except (ArtworkBrowserError, ValueError) as e:
+            return _artwork_error(e, 404)
+        except Exception as e:
+            debug_me(f"Current asset thumbnail failed: {e}")
+            return _artwork_error("could not read the current file", 500)
+        if data is None:
+            return _artwork_error("no file", 404)
+        response = web_app.response_class(data, mimetype="image/jpeg")
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     def webhook_token_ok():
         """A webhook request is authorised when it carries the configured token, sent as the
@@ -922,8 +1013,10 @@ def setup_socket_handlers(
             if password:
                 password_change = not AuthenticationService.verify_password(password, globals.config.auth_password_hash)
 
+            form = clean_settings_form(data.get("config"))
+
             # Unpack the config dictionary into the local config
-            for key, value in data.get("config").items():
+            for key, value in form.items():
                 new_config_dict[key] = value
 
             # Normalize the notification channels sent from the web UI into {"url", "events"} form

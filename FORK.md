@@ -49,6 +49,34 @@ real run and every later run don't fetch them again.
   show as `skip` in the report.
 - A user listed twice in the bulk file keeps their first (higher) place.
 
+## Artwork tab: picking a different poster
+
+With ranked mode on, the **Artwork** tab lists every film and show that has posters from the ranked users.
+Open one to see its main poster and each season, with every option best-ranked first, next to the file in
+the Kometa asset folder now.
+
+- **Click a poster to use it.** It's *pinned* for the item in every library that holds it (Movies and
+  Movies 4K, say) and applied straight away, written to the asset folder and uploaded to Plex, with the file it
+  replaces moved to the backup folder as usual. Every ranked run, the daily one and Sonarr/Radarr imports,
+  then keeps it.
+- **Unpin** hands the slot back to the ranking, again straight away.
+- With the dry run on, a pick is saved but nothing changes until the dry run is off. During a ranked run, a
+  pick is saved and the next run applies it.
+- A pinned poster that disappears from ThePosterDB leaves the slot as it is. It doesn't fall back to the ranking.
+- The list is built from the cache and never reads a ThePosterDB page; it's rebuilt every 30 minutes, or
+  with **Refresh**. A poster whose item can only be decided by reading its page doesn't show until a ranked
+  run has read it.
+- Thumbnails are made the first time a poster is shown (one paced download each) and kept in
+  `config/artwork_thumbs/`.
+
+Pins live in the `ranked_pins` table of `config/asset_index.db`.
+
+## Settings page fixes
+
+- Saving settings no longer overwrites schedules with the page's (possibly older) copy of them. Schedules
+  are saved by their own add and delete buttons.
+- Saving with webhooks switched off no longer empties the webhook token.
+
 ## Writing files
 
 The new poster is written in full first; only then is the old file moved to the backup folder. A backup never
@@ -56,8 +84,8 @@ overwrites an earlier backup (a second one in the same folder becomes `poster.1.
 
 ## State
 
-Ranked mode keeps its state in three tables in `config/asset_index.db`:
-`ranked_asset_meta`, `ranked_applied`, `ranked_order`. Deleting those tables makes the next run treat
+Ranked mode keeps its state in four tables in `config/asset_index.db`:
+`ranked_asset_meta`, `ranked_applied`, `ranked_order`, `ranked_pins` (hand-picked posters). Deleting those tables makes the next run treat
 everything as new (it will compare against the asset folders again; nothing is lost).
 
 ## Docker image

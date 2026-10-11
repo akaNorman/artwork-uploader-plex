@@ -54,6 +54,10 @@ POSTER_SLOT = "poster"
 # Only one ranked pass may write at a time (the scheduled run and a webhook import could overlap).
 _APPLY_LOCK = threading.Lock()
 
+
+class RankedBusy(Exception):
+    """Another ranked pass holds the lock."""
+
 ACTION_NEW = "new"                # nothing in the asset folder yet - save and upload
 ACTION_REPLACE = "replace"        # a different poster is there - back it up, save and upload
 ACTION_KEEP = "keep"              # the winner is already the file in the folder - just record it
@@ -112,7 +116,9 @@ class RankedStore:
        - ranked_applied: per Plex item and slot, which asset was last applied and whether it has
          reached Plex yet (a staged season hasn't).
        - ranked_order: the ranking used by the last scheduled run, so webhook imports use the
-         same order."""
+         same order.
+       - ranked_pins: posters picked by hand on the Artwork tab, per item (kind + TMDb ID, so
+         every library holding it) and slot. A pin beats the ranking until it's removed."""
 
     def __init__(self, path: str = ASSET_INDEX_PATH) -> None:
         self.path = path
@@ -143,6 +149,15 @@ class RankedStore:
                 CREATE TABLE IF NOT EXISTS ranked_order (
                     position INTEGER PRIMARY KEY,
                     user_key TEXT NOT NULL
+                )""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ranked_pins (
+                    kind      TEXT    NOT NULL,
+                    tmdb_id   INTEGER NOT NULL,
+                    slot      TEXT    NOT NULL,
+                    asset_id  INTEGER NOT NULL,
+                    pinned_at TEXT,
+                    PRIMARY KEY (kind, tmdb_id, slot)
                 )""")
             conn.commit()
         finally:
@@ -227,6 +242,34 @@ class RankedStore:
         conn = self._connect()
         try:
             return [row["user_key"] for row in conn.execute("SELECT user_key FROM ranked_order ORDER BY position")]
+        finally:
+            conn.close()
+
+    # --- hand-picked posters -----------------------------------------------------------------
+    def pins(self) -> Dict[Tuple[str, int, str], int]:
+        conn = self._connect()
+        try:
+            return {(row["kind"], row["tmdb_id"], row["slot"]): row["asset_id"]
+                    for row in conn.execute("SELECT kind, tmdb_id, slot, asset_id FROM ranked_pins")}
+        finally:
+            conn.close()
+
+    def set_pin(self, kind: str, tmdb_id: int, slot: str, asset_id: int) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("""
+                INSERT INTO ranked_pins (kind, tmdb_id, slot, asset_id, pinned_at) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(kind, tmdb_id, slot) DO UPDATE SET asset_id=excluded.asset_id,
+                    pinned_at=excluded.pinned_at""", (kind, tmdb_id, slot, asset_id, _now()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def delete_pin(self, kind: str, tmdb_id: int, slot: str) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM ranked_pins WHERE kind=? AND tmdb_id=? AND slot=?", (kind, tmdb_id, slot))
+            conn.commit()
         finally:
             conn.close()
 
@@ -404,6 +447,7 @@ class RankedService:
         report_label: str = "ranked",
         write_report: bool = True,
         quiet: bool = False,
+        offline: bool = False,
     ) -> None:
         self.movie_libraries = movie_libraries or []
         self.tv_libraries = tv_libraries or []
@@ -426,12 +470,17 @@ class RankedService:
         self.report_label = report_label
         self.write_report = write_report
         self.quiet = quiet  # single-title (webhook) runs: no run summary in the log
+        # Offline (the Artwork tab's listing): never read a poster page; a poster whose item
+        # can't be decided from what's cached is simply left out.
+        self.offline = offline
         self.run_stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
         self._library_index: Optional[PlexLibraryIndex] = None
         self._by_tmdb: Dict[Tuple[str, int], List[dict]] = {}
         self._meta: Dict[int, sqlite3.Row] = {}
         self._applied: Dict[Tuple[str, int, str], sqlite3.Row] = {}
+        self._pins: Dict[Tuple[str, int, str], int] = {}
+        self._groups: Dict[Tuple[str, int, str], List[Candidate]] = {}
         self._folders: Dict[Tuple[str, int], Optional[str]] = {}
         # (library, asset folder) -> the different items (TMDb ID, or rating key without one) using it
         self._folder_owners: Dict[Tuple[str, str], set] = {}
@@ -464,13 +513,9 @@ class RankedService:
             return result
 
         started = time.time()
-        self._build_inventory()
-        self._meta = self.store.all_meta()
-        self._applied = self.store.all_applied()
-
-        rows = self._load_assets(only_title)
+        rows = self.prepare(only_title)
         result.assets_considered = len(rows)
-        groups = self._group(rows, result)
+        groups = self._groups
         self._debug(f"{len(rows)} cached posters from {len(self.user_keys)} users matched "
                     f"{len(groups)} item slots in your libraries")
 
@@ -482,32 +527,76 @@ class RankedService:
                 break
             if i % 25 == 0 or i == total:
                 self._progress(i, total, f"Ranked mode • choosing posters • {i} of {total}")
-            kind, tmdb_id, slot = key
-            chosen = self._choose(tmdb_id, candidates)
-            if chosen is None:
-                continue
-            for entry in self._by_tmdb.get((kind, tmdb_id), []):
-                result.slots_considered += 1
-                try:
-                    decision = self._decide(entry, slot, chosen)
-                except Exception as e:
-                    result.failed += 1
-                    self._log(f"❌ {self._describe(entry, slot)} • could not check the current poster: {e}")
-                    continue
-                if decision is None:
-                    continue
-                if not self.dry_run and decision.action != ACTION_SKIP:
-                    if not self._execute(decision):
-                        result.failed += 1
-                        continue
-                decisions.append(decision)
-                result.counts[decision.action] = result.counts.get(decision.action, 0) + 1
-                if NOT_COMPARED_NOTE in decision.note:
-                    result.not_compared += 1
-                if decision.action in (ACTION_NEW, ACTION_REPLACE, ACTION_STAGE, ACTION_UPLOAD_STAGED):
-                    author = decision.candidate.row["author"] or decision.candidate.row["user_key"]
-                    result.by_user[author] = result.by_user.get(author, 0) + 1
+            self._process(key, candidates, result, decisions)
 
+        return self._finish(result, decisions, started)
+
+    def prepare(self, only_title=None) -> List[sqlite3.Row]:
+        """List the libraries, load what's remembered, and match every cached poster to its item
+           and slot (kept in self._groups). Returns the cached posters considered."""
+        self._build_inventory()
+        self._meta = self.store.all_meta()
+        self._applied = self.store.all_applied()
+        self._pins = self.store.pins()
+        rows = self._load_assets(only_title)
+        self._groups = self._group(rows, None)
+        return rows
+
+    def apply_item(self, kind: str, tmdb_id: int, wait: bool = True) -> RankedResult:
+        """Choose and apply every slot of one item (all libraries holding it) straight away, using
+           the inventory from an earlier prepare(). Used when a poster is picked or unpicked on the
+           Artwork tab. Poster pages may be read here even on an offline service. With wait=False
+           it raises RankedBusy instead of waiting for a ranked run that's in progress."""
+        if not _APPLY_LOCK.acquire(blocking=wait):
+            raise RankedBusy("a ranked run is in progress")
+        try:
+            result = RankedResult(dry_run=self.dry_run)
+            started = time.time()
+            self._meta = self.store.all_meta()
+            self._applied = self.store.all_applied()
+            self._pins = self.store.pins()
+            offline, self.offline = self.offline, False
+            try:
+                decisions: List[Decision] = []
+                for key, candidates in self._groups.items():
+                    if key[0] == kind and key[1] == tmdb_id:
+                        self._process(key, candidates, result, decisions)
+            finally:
+                self.offline = offline
+            return self._finish(result, decisions, started)
+        finally:
+            _APPLY_LOCK.release()
+
+    def _process(self, key, candidates: List[Candidate], result: RankedResult, decisions: List[Decision]) -> None:
+        """Choose the winner for one item slot and decide (and, unless a dry run, apply) it for
+           every library holding the item."""
+        kind, tmdb_id, slot = key
+        chosen = self._choose(key, candidates)
+        if chosen is None:
+            return
+        for entry in self._by_tmdb.get((kind, tmdb_id), []):
+            result.slots_considered += 1
+            try:
+                decision = self._decide(entry, slot, chosen)
+            except Exception as e:
+                result.failed += 1
+                self._log(f"❌ {self._describe(entry, slot)} • could not check the current poster: {e}")
+                continue
+            if decision is None:
+                continue
+            if not self.dry_run and decision.action != ACTION_SKIP:
+                if not self._execute(decision):
+                    result.failed += 1
+                    continue
+            decisions.append(decision)
+            result.counts[decision.action] = result.counts.get(decision.action, 0) + 1
+            if NOT_COMPARED_NOTE in decision.note:
+                result.not_compared += 1
+            if decision.action in (ACTION_NEW, ACTION_REPLACE, ACTION_STAGE, ACTION_UPLOAD_STAGED):
+                author = decision.candidate.row["author"] or decision.candidate.row["user_key"]
+                result.by_user[author] = result.by_user.get(author, 0) + 1
+
+    def _finish(self, result: RankedResult, decisions: List[Decision], started: float) -> RankedResult:
         result.page_requests = self.tpdb.page_requests
         result.image_requests = self.tpdb.image_requests
         if self.write_report and decisions:
@@ -560,7 +649,7 @@ class RankedService:
         return rows
 
     # --- step 3: match each poster to an item and group by item + slot ------------------------
-    def _group(self, rows: List[sqlite3.Row], result: RankedResult) -> Dict[Tuple[str, int, str], List[Candidate]]:
+    def _group(self, rows: List[sqlite3.Row], result=None) -> Dict[Tuple[str, int, str], List[Candidate]]:
         groups: Dict[Tuple[str, int, str], List[Candidate]] = {}
         for row in rows:
             media_type = row["media_type"]
@@ -616,6 +705,8 @@ class RankedService:
         return int(tmdb_id), bool(exact_year or page_checked_no_id)
 
     def _read_page(self, asset_id: int) -> Optional[int]:
+        if self.offline:
+            return None  # not cached, and an offline service doesn't fetch
         page_read, tmdb_id = self.tpdb.tmdb_id(asset_id)
         if page_read:
             self.store.set_page_result(asset_id, tmdb_id)
@@ -623,8 +714,15 @@ class RankedService:
         return tmdb_id
 
     # --- step 4: pick the winner for a slot ---------------------------------------------------
-    def _choose(self, tmdb_id: int, candidates: List[Candidate]) -> Optional[Candidate]:
-        for candidate in sorted(candidates, key=lambda c: (c.rank, -c.asset_id)):
+    def _choose(self, key: Tuple[str, int, str], candidates: List[Candidate]) -> Optional[Candidate]:
+        tmdb_id = key[1]
+        pinned = self._pins.get(key)
+        if pinned is not None:
+            # Picked by hand on the Artwork tab: that poster, whatever the ranking says. If it's no
+            # longer among this item's posters (removed from ThePosterDB, say), leave the slot as it
+            # is rather than quietly falling back to the ranking.
+            return next((c for c in candidates if c.asset_id == pinned), None)
+        for candidate in self.ranked(candidates):
             if candidate.verified:
                 return candidate
             meta = self._meta.get(candidate.asset_id)
@@ -643,6 +741,11 @@ class RankedService:
             if page_tmdb is None or page_tmdb == tmdb_id:
                 return candidate  # no ID on the page: trust the title match, as upstream does
         return None
+
+    @staticmethod
+    def ranked(candidates: List[Candidate]) -> List[Candidate]:
+        """Best first: the highest-ranked user, and within a user their newest upload."""
+        return sorted(candidates, key=lambda c: (c.rank, -c.asset_id))
 
     # --- step 5: what to do for one item ------------------------------------------------------
     def _decide(self, entry: dict, slot: str, chosen: Candidate) -> Optional[Decision]:

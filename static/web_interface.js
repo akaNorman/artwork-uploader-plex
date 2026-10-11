@@ -1823,6 +1823,8 @@ function configureTabs(afterSave = false) {
         document.getElementById('scraping-log-tab').classList.add("show");
         document.getElementById('run-history-tab').classList.add("show");
         document.getElementById('about-tab').classList.add("show");
+        // Fork: the Artwork tab picks between the ranked users' posters, so only with ranked mode on
+        document.getElementById('artwork-tab').classList.toggle("show", !!(config.base_url && config.token && config.ranked_mode));
         if (config.base_url && config.token) {
             document.getElementById('bulk-import-tab').classList.add("show");
             document.getElementById('scraper-tab').classList.add("show");
@@ -3533,19 +3535,14 @@ function toggleWebhookSettings() {
     document.getElementById("webhook_settings").style.display = enabled ? "block" : "none";
     // When enabling with an empty token, pre-fill a random one. getRandomValues works in
     // insecure (plain http) contexts, unlike crypto.randomUUID.
+    // Fork: the token is kept (just hidden) while webhooks are off. Emptying the box meant the
+    // next Save stored an empty token, breaking the URL Sonarr/Radarr already use.
     const tokenField = document.getElementById("webhook_token");
     if (enabled) {
         tokenField.setAttribute("required", "");
-        if (tokenField.dataset.originalValue) {
-            tokenField.value = tokenField.dataset.originalValue;
-        }
     } else {
         tokenField.removeAttribute("required");
         tokenField.classList.remove("is-invalid", "is-valid");
-        if (!tokenField.dataset.originalValue) {
-            tokenField.dataset.originalValue = tokenField.value;
-        }
-        tokenField.value='';
     }
 }
 

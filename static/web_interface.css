@@ -1248,3 +1248,20 @@ Theme Switcher Dropdown Icons (Fix dark mode SVG fills)
         grid-row: 1 / span 2; /* Occupies the entire right column */
     }
 }
+
+/* Fork: Artwork tab (ranked mode) */
+.artwork-search { max-width: 320px; }
+.artwork-list { max-height: 70vh; overflow-y: auto; }
+.artwork-options { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 0.75rem; }
+.artwork-option { min-width: 0; }
+.artwork-option img, .artwork-thumb-missing {
+    display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover;
+    border-radius: 0.5rem; background: var(--bs-secondary-bg);
+}
+.artwork-thumb-missing { display: grid; place-items: center; font-size: 0.75rem; color: var(--bs-secondary-color); }
+.artwork-pick { display: block; width: 100%; padding: 0; border: 0; background: none; border-radius: 0.5rem; cursor: pointer; }
+.artwork-pick:hover img, .artwork-pick:focus-visible img { outline: 3px solid var(--bs-primary); outline-offset: 2px; }
+.artwork-option.current img { outline: 3px solid var(--bs-success); outline-offset: 2px; }
+.artwork-option.pinned img { outline: 3px solid var(--bs-warning); outline-offset: 2px; }
+.artwork-option.pinned .artwork-pick { cursor: default; }
+.artwork-now img { opacity: 0.85; }
