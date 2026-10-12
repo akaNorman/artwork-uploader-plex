@@ -325,6 +325,59 @@ def test_year_one_out_is_checked_against_the_poster_page_and_skipped_if_wrong(en
     assert tpdb.page_requests == 0
 
 
+def test_years_further_apart_match_when_the_poster_page_confirms_the_tmdb_id(env):
+    # ThePosterDB says 2021 (production), Plex says 2023 (first aired): Everyone Is Doing Great
+    show = FakeItem(10, "Everyone Is Doing Great", 2023, 116600, location="/tv/Everyone Is Doing Great", seasons=(1, 2))
+    env.index.record("akanorman", [asset(754296, "Everyone Is Doing Great", 2021, "show_cover"),
+                                   asset(754297, "Everyone Is Doing Great", 2021, "season_cover", season=1),
+                                   asset(754298, "Everyone Is Doing Great", 2021, "season_cover", season=2)])
+    tpdb = FakeTPDb(images={f"{TPDB}/{i}": f"img{i}".encode() for i in (754296, 754297, 754298)},
+                    pages={754296: 116600, 754297: 116600, 754298: 116600})
+
+    result = service(env, [], [FakeLibrary("TV", "show", [show])], ["akanorman"], tpdb).run()
+
+    assert result.counts == {ACTION_NEW: 3}
+    assert show.uploads == [b"img754296"]
+    assert show.season_obj(2).uploads == [b"img754298"]
+    # Confirmed once: the next run trusts the remembered page and reads nothing.
+    tpdb.page_requests = 0
+    service(env, [], [FakeLibrary("TV", "show", [show])], ["akanorman"], tpdb).run()
+    assert tpdb.page_requests == 0
+
+
+def test_a_same_title_remake_years_apart_is_never_put_on_the_wrong_film(env):
+    dune = FakeItem(1, "Dune", 2021, 438631, path="/m/Dune (2021)/Dune.mkv")
+    env.index.record("darkmatte", [asset(100, "Dune", 1984)])          # Lynch's Dune: TMDb 841
+    env.index.record("other", [asset(200, "Dune", 2021)])
+    tpdb = FakeTPDb(images={f"{TPDB}/100": b"1984", f"{TPDB}/200": b"2021"}, pages={100: 841})
+
+    service(env, [FakeLibrary("Movies", "movie", [dune])], [], ["darkmatte", "other"], tpdb).run()
+
+    assert dune.uploads == [b"2021"]
+    assert tpdb.page_requests == 1
+
+
+def test_a_title_only_match_whose_page_has_no_tmdb_id_is_not_used(env):
+    dune = FakeItem(1, "Dune", 2021, 438631, path="/m/Dune (2021)/Dune.mkv")
+    env.index.record("darkmatte", [asset(100, "Dune", 1984)])
+    tpdb = FakeTPDb(images={f"{TPDB}/100": b"1984"}, pages={100: None})
+
+    result = service(env, [FakeLibrary("Movies", "movie", [dune])], [], ["darkmatte"], tpdb).run()
+
+    assert result.counts == {} and dune.uploads == []
+
+
+def test_an_unreadable_page_for_a_title_only_match_does_not_hold_the_slot_up(env):
+    dune = FakeItem(1, "Dune", 2021, 438631, path="/m/Dune (2021)/Dune.mkv")
+    env.index.record("darkmatte", [asset(100, "Dune", 1984)])
+    env.index.record("other", [asset(200, "Dune", 2021)])
+    tpdb = FakeTPDb(images={f"{TPDB}/200": b"2021"}, pages={100: "unreachable"})
+
+    service(env, [FakeLibrary("Movies", "movie", [dune])], [], ["darkmatte", "other"], tpdb).run()
+
+    assert dune.uploads == [b"2021"]
+
+
 def test_titles_not_in_the_library_are_ignored_without_any_request(env):
     movie = FakeItem(1, "Alien", 1979, 348, path="/m/Alien (1979)/Alien.mkv")
     env.index.record("darkmatte", [asset(100, "Some Film I Don't Own", 2001)])

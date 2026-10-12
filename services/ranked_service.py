@@ -392,6 +392,9 @@ class Candidate:
     asset_id: int
     row: sqlite3.Row
     verified: bool
+    # Matched on title alone (the years are more than one apart): used only if its poster page
+    # carries the item's TMDb ID - a page without one doesn't count.
+    needs_page_id: bool = False
 
 
 @dataclass
@@ -664,35 +667,41 @@ class RankedService:
             resolved = self._resolve(row, kind)
             if resolved is None:
                 continue
-            tmdb_id, verified = resolved
+            tmdb_id, verified, needs_page_id = resolved
             if (kind, tmdb_id) not in self._by_tmdb:
                 continue
             groups.setdefault((kind, tmdb_id, slot), []).append(
                 Candidate(rank=self.rank.get(row["user_key"], len(self.rank)),
-                          asset_id=int(row["asset_id"]), row=row, verified=verified))
+                          asset_id=int(row["asset_id"]), row=row, verified=verified,
+                          needs_page_id=needs_page_id))
         return groups
 
-    def _resolve(self, row: sqlite3.Row, kind: str) -> Optional[Tuple[int, bool]]:
-        """Which TMDb ID this poster is for, and whether that is confirmed.
+    def _resolve(self, row: sqlite3.Row, kind: str) -> Optional[Tuple[int, bool, bool]]:
+        """Which TMDb ID this poster is for, whether that is confirmed, and whether it may only be
+           used once its poster page confirms the TMDb ID.
 
            A poster page read earlier is the authority. Otherwise the title is matched against the
            library in memory: a match on the same title AND the same year counts as confirmed; a
            match one year out (or with no year) is only provisional, and the poster page is read
            if and when that poster would actually win. A title that matches several different
-           items (same-name remakes) has its poster page read straight away."""
+           items (same-name remakes) has its poster page read straight away.
+
+           A title that matches exactly one item whose year is further out (ThePosterDB and Plex
+           can disagree by years, e.g. a show's production year vs its first airing) is a
+           candidate only if its poster page carries that item's TMDb ID."""
         asset_id = int(row["asset_id"])
         meta = self._meta.get(asset_id)
         if meta is not None and meta["page_checked"] and meta["tmdb_id"] is not None:
-            return int(meta["tmdb_id"]), True
+            return int(meta["tmdb_id"]), True, False
 
         status, match = self._library_index.lookup(row["title"] or "", row["year"], kind)
         if status == "not_found":
-            return None
+            return self._resolve_by_title_only(row, kind, meta)
         if status == "ambiguous":
             if meta is not None and meta["page_checked"]:
                 return None  # the page had no TMDb ID, and the title alone can't decide
             tmdb_id = self._read_page(asset_id)
-            return (tmdb_id, True) if tmdb_id is not None else None
+            return (tmdb_id, True, False) if tmdb_id is not None else None
 
         tmdb_id = match.get("tmdb_id") if match else None
         if tmdb_id is None:
@@ -702,7 +711,18 @@ class RankedService:
             self._by_tmdb.setdefault((kind, tmdb_id), []).append(match)
         page_checked_no_id = meta is not None and meta["page_checked"]
         exact_year = row["year"] is not None and match.get("year") == row["year"]
-        return int(tmdb_id), bool(exact_year or page_checked_no_id)
+        return int(tmdb_id), bool(exact_year or page_checked_no_id), False
+
+    def _resolve_by_title_only(self, row: sqlite3.Row, kind: str, meta) -> Optional[Tuple[int, bool, bool]]:
+        if row["year"] is None or self.offline:
+            return None  # no year: the lookup above already ignored it; offline: no page to confirm
+        if meta is not None and meta["page_checked"]:
+            return None  # the page was read and had no TMDb ID, so nothing can confirm it
+        status, match = self._library_index.lookup(row["title"] or "", None, kind)
+        tmdb_id = match.get("tmdb_id") if status == "matched" and match else None
+        if tmdb_id is None:
+            return None
+        return int(tmdb_id), False, True
 
     def _read_page(self, asset_id: int) -> Optional[int]:
         if self.offline:
@@ -732,13 +752,17 @@ class RankedService:
                 page_tmdb = self._read_page(candidate.asset_id)
                 meta = self._meta.get(candidate.asset_id)
                 if meta is None or not meta["page_checked"]:
+                    if candidate.needs_page_id:
+                        continue  # a title-only match is a long shot; don't hold the slot up for it
                     # The page couldn't be fetched this time. Don't guess, and don't fall back
                     # to a lower-ranked poster either (the next run would only swap it back):
                     # leave the slot alone until the page can be read.
                     self._debug(f"Could not read the poster page for asset {candidate.asset_id}; "
                                 f"slot left alone this run")
                     return None
-            if page_tmdb is None or page_tmdb == tmdb_id:
+            if page_tmdb == tmdb_id:
+                return candidate
+            if page_tmdb is None and not candidate.needs_page_id:
                 return candidate  # no ID on the page: trust the title match, as upstream does
         return None
 

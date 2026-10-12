@@ -68,6 +68,22 @@ def test_the_listing_never_reads_a_poster_page(env):
     assert (MOVIE, 1091, "poster") in svc._groups
 
 
+def test_the_listing_shows_a_title_only_match_once_a_run_has_confirmed_it(env):
+    show = FakeItem(10, "Everyone Is Doing Great", 2023, 116600, location="/tv/Everyone Is Doing Great", seasons=(1,))
+    tv = [FakeLibrary("TV", "show", [show])]
+    env.index.record("akanorman", [asset(754296, "Everyone Is Doing Great", 2021, "show_cover")])
+    tpdb = FakeTPDb(images={f"{TPDB}/754296": b"img"}, pages={754296: 116600})
+
+    before = service(env, [], tv, ["akanorman"], tpdb, offline=True)
+    before.prepare()
+    assert before._groups == {} and tpdb.page_requests == 0   # unconfirmed: not offered yet
+
+    service(env, [], tv, ["akanorman"], tpdb, dry_run=True).run()   # a run reads and remembers the page
+    after = service(env, [], tv, ["akanorman"], tpdb, offline=True)
+    after.prepare()
+    assert ("TV Show", 116600, "poster") in after._groups
+
+
 def test_apply_item_applies_a_pin_to_every_library_and_backs_up(env):
     movie, uhd, libraries, tpdb = _alien_setup(env)
     svc = service(env, libraries, [], ["darkmatte", "other"], tpdb)

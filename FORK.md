@@ -42,6 +42,9 @@ real run and every later run don't fetch them again.
 - Title matches but the year is one out (or missing): the poster page on ThePosterDB is read once, only
   if that poster would win, to confirm the TMDb ID.
 - A title that matches several different items (same-name remakes): the poster page is read once.
+- Title matches exactly one item but the years are further apart (ThePosterDB and Plex can disagree, e.g. a
+  show's production year vs its first airing): used only if its poster page carries that item's TMDb ID.
+  The page is read once, only if that poster would win, and a page without a TMDb ID doesn't count.
 - If a poster page that's needed can't be read, the slot is left alone for that run rather than given to a
   lower-ranked user.
 - An asset folder used by more than one different item in a library (films side by side in one folder, loose
