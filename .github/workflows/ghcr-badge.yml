@@ -1,0 +1,47 @@
+name: Update GHCR Pulls Badge
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  update-badge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch GHCR pull count
+        id: fetch
+        run: |
+          HTML=$(curl -sL "https://github.com/mscodemonkey/artwork-uploader-plex/pkgs/container/artwork-uploader" | tr '\n' ' ')
+          PULLS=$(echo "$HTML" | grep -oP 'Total downloads</span>\s*<h3[^>]*>\K[^<]+' | xargs)
+          if [ -z "$PULLS" ]; then
+            PULLS="unknown"
+          fi
+          echo "pulls=$PULLS" >> $GITHUB_OUTPUT
+          echo "Detected pulls: $PULLS"
+
+      - name: Commit JSON to badges branch
+        if: steps.fetch.outputs.pulls != 'unknown'
+        run: |
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          cat <<EOF > ghcr-pulls.json
+          {
+            "schemaVersion": 1,
+            "label": "docker pulls",
+            "message": "${{ steps.fetch.outputs.pulls }}",
+            "color": "2496ED",
+            "namedLogo": "docker",
+            "logoColor": "white"
+          }
+          EOF
+          git checkout -b badges
+          git add ghcr-pulls.json
+          git commit -m "chore: update ghcr pulls badge"
+          git push origin badges --force
